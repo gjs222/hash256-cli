@@ -41,14 +41,30 @@
 #include <cuda_runtime.h>
 
 /* -- Tuning ---------------------------------------------------------------- */
-#define BLOCK_SIZE        256   /* threads per block -- multiple of 32 */
+// T4 prefers a slightly smaller block size for complex kernels to maximize occupancy and minimize register spilling.
+// The optimal configuration is auto-tuned at startup!
 #define MIN_BLOCKS_PER_SM   2   /* hint to __launch_bounds__ for reg alloc */
-#define WORK_PER_THREAD     8   /* nonces each thread tries per kernel call */
+
+// Toggle for experimental Warp-Cooperative Keccak (Step 9)
+// 1 = 1 Warp per Hash (32 threads share 1 state)
+// 0 = 1 Thread per Hash (Default)
+#define WARP_COOP 1
 
 /* -- Constant memory (L1-cached, broadcast to all threads in warp) --------- */
 __constant__ uint8_t  d_challenge[32];
 __constant__ uint8_t  d_prefix[24];
-__constant__ uint64_t d_difficulty_be[4]; /* difficulty as 4 big-endian u64 */
+__constant__ ulonglong4 d_difficulty_be_vec; /* difficulty as 4 big-endian u64 packed in vector */
+
+#if WARP_COOP
+__constant__ int d_rot[25] = {
+    0,  44, 43, 21, 14,
+    28, 20, 3,  45, 61,
+    1,  6,  25, 8,  18,
+    27, 36, 10, 15, 56,
+    62, 55, 39, 41, 2
+};
+#endif
+
 __constant__ uint64_t d_RC[24] = {
     0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL,
     0x8000000080008000ULL, 0x000000000000808bULL, 0x0000000080000001ULL,
@@ -61,7 +77,29 @@ __constant__ uint64_t d_RC[24] = {
 };
 
 /* -- Helpers --------------------------------------------------------------- */
-#define ROTL64(x,n) (((x)<<(n))|((x)>>(64-(n))))
+
+/* Inline PTX 64-bit rotate left.
+ * T4 (Turing) supports shf.l.wrap.b32 (funnel shift).
+ * A 64-bit rotate left by n (0 < n < 64) is achieved using two 32-bit funnel shifts.
+ */
+__device__ __forceinline__ uint64_t rotl64_ptx(uint64_t x, int n) {
+    uint32_t lo = (uint32_t)x;
+    uint32_t hi = (uint32_t)(x >> 32);
+    uint32_t res_lo, res_hi;
+    if (n < 32) {
+        asm("shf.l.wrap.b32 %0, %1, %2, %3;" : "=r"(res_lo) : "r"(lo), "r"(hi), "r"(n));
+        asm("shf.l.wrap.b32 %0, %1, %2, %3;" : "=r"(res_hi) : "r"(hi), "r"(lo), "r"(n));
+    } else if (n > 32) {
+        asm("shf.l.wrap.b32 %0, %1, %2, %3;" : "=r"(res_lo) : "r"(hi), "r"(lo), "r"(n - 32));
+        asm("shf.l.wrap.b32 %0, %1, %2, %3;" : "=r"(res_hi) : "r"(lo), "r"(hi), "r"(n - 32));
+    } else { // n == 32
+        res_lo = hi;
+        res_hi = lo;
+    }
+    return ((uint64_t)res_hi << 32) | res_lo;
+}
+
+#define ROTL64(x, n) rotl64_ptx((x), (n))
 
 /* Byte-swap uint64 (big-endian counter <-> little-endian keccak lane) */
 __device__ __forceinline__ uint64_t bswap64(uint64_t x) {
@@ -80,82 +118,152 @@ __device__ __forceinline__ uint64_t load_le64_const(const uint8_t* p) {
     return v;
 }
 
-/* -- Keccak-f[1600] --------------------------------------------------------
- *
- * rho+pi are applied via an explicit B[] array, matching keccak256_mine.cl
- * exactly. This avoids any aliasing ambiguity in the in-place chained form.
- * The 25 B variables and 25 s variables all live in registers (no spill at
- * BLOCK_SIZE=256, MIN_BLOCKS_PER_SM=2 with nvcc -O3).
- */
-__device__ __forceinline__ void keccak_f1600(uint64_t s[25]) {
-    uint64_t C0,C1,C2,C3,C4, D0,D1,D2,D3,D4;
-    uint64_t B00,B01,B02,B03,B04,B05,B06,B07,B08,B09,
-             B10,B11,B12,B13,B14,B15,B16,B17,B18,B19,
-             B20,B21,B22,B23,B24;
-
-    #pragma unroll
-    for (int r = 0; r < 24; r++) {
-        /* theta */
-        C0=s[0]^s[5]^s[10]^s[15]^s[20]; C1=s[1]^s[6]^s[11]^s[16]^s[21];
-        C2=s[2]^s[7]^s[12]^s[17]^s[22]; C3=s[3]^s[8]^s[13]^s[18]^s[23];
-        C4=s[4]^s[9]^s[14]^s[19]^s[24];
-        D0=C4^ROTL64(C1,1); D1=C0^ROTL64(C2,1); D2=C1^ROTL64(C3,1);
-        D3=C2^ROTL64(C4,1); D4=C3^ROTL64(C0,1);
-        s[ 0]^=D0; s[ 5]^=D0; s[10]^=D0; s[15]^=D0; s[20]^=D0;
-        s[ 1]^=D1; s[ 6]^=D1; s[11]^=D1; s[16]^=D1; s[21]^=D1;
-        s[ 2]^=D2; s[ 7]^=D2; s[12]^=D2; s[17]^=D2; s[22]^=D2;
-        s[ 3]^=D3; s[ 8]^=D3; s[13]^=D3; s[18]^=D3; s[23]^=D3;
-        s[ 4]^=D4; s[ 9]^=D4; s[14]^=D4; s[19]^=D4; s[24]^=D4;
-
-        /* rho + pi -> B[]  (verified against keccak256_mine.cl) */
-        B00=           s[ 0]; B10=ROTL64(s[ 1], 1); B20=ROTL64(s[ 2],62);
-        B05=ROTL64(s[ 3],28); B15=ROTL64(s[ 4],27);
-        B16=ROTL64(s[ 5],36); B01=ROTL64(s[ 6],44); B11=ROTL64(s[ 7], 6);
-        B21=ROTL64(s[ 8],55); B06=ROTL64(s[ 9],20);
-        B07=ROTL64(s[10], 3); B17=ROTL64(s[11],10); B02=ROTL64(s[12],43);
-        B12=ROTL64(s[13],25); B22=ROTL64(s[14],39);
-        B23=ROTL64(s[15],41); B08=ROTL64(s[16],45); B18=ROTL64(s[17],15);
-        B03=ROTL64(s[18],21); B13=ROTL64(s[19], 8);
-        B14=ROTL64(s[20],18); B24=ROTL64(s[21], 2); B09=ROTL64(s[22],61);
-        B19=ROTL64(s[23],56); B04=ROTL64(s[24],14);
-
-        /* chi */
-        s[ 0]=B00^(~B01&B02); s[ 1]=B01^(~B02&B03); s[ 2]=B02^(~B03&B04);
-        s[ 3]=B03^(~B04&B00); s[ 4]=B04^(~B00&B01);
-        s[ 5]=B05^(~B06&B07); s[ 6]=B06^(~B07&B08); s[ 7]=B07^(~B08&B09);
-        s[ 8]=B08^(~B09&B05); s[ 9]=B09^(~B05&B06);
-        s[10]=B10^(~B11&B12); s[11]=B11^(~B12&B13); s[12]=B12^(~B13&B14);
-        s[13]=B13^(~B14&B10); s[14]=B14^(~B10&B11);
-        s[15]=B15^(~B16&B17); s[16]=B16^(~B17&B18); s[17]=B17^(~B18&B19);
-        s[18]=B18^(~B19&B15); s[19]=B19^(~B15&B16);
-        s[20]=B20^(~B21&B22); s[21]=B21^(~B22&B23); s[22]=B22^(~B23&B24);
-        s[23]=B23^(~B24&B20); s[24]=B24^(~B20&B21);
-
-        /* iota */
-        s[0] ^= d_RC[r];
-    }
-}
-
 /* -- Difficulty comparison: first 32 output bytes (LE lanes 0-3) < target -- */
-__device__ __forceinline__ bool hash_lt_difficulty(const uint64_t s[25]) {
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        uint64_t h_be = bswap64(s[i]);
-        if (h_be < d_difficulty_be[i]) return true;
-        if (h_be > d_difficulty_be[i]) return false;
-    }
+__device__ __forceinline__ bool hash_lt_difficulty(const uint64_t s0, const uint64_t s1, const uint64_t s2, const uint64_t s3) {
+    // We compare word by word (big-endian).
+    // ulonglong4 allows a vectorized load from constant memory.
+    ulonglong4 diff = d_difficulty_be_vec;
+    
+    uint64_t h_be;
+    
+    h_be = bswap64(s0);
+    if (h_be < diff.x) return true;
+    if (h_be > diff.x) return false;
+
+    h_be = bswap64(s1);
+    if (h_be < diff.y) return true;
+    if (h_be > diff.y) return false;
+
+    h_be = bswap64(s2);
+    if (h_be < diff.z) return true;
+    if (h_be > diff.z) return false;
+
+    h_be = bswap64(s3);
+    if (h_be < diff.w) return true;
+    if (h_be > diff.w) return false;
+
     return false;
 }
 
 /* -- Mining kernel --------------------------------------------------------- */
+
+// Persistent kernel parameters
+__device__ uint64_t g_nonce_allocator = 0;
+
+#if WARP_COOP
+
+template <int BLOCK_SIZE_T>
 __global__
-__launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM)
+__launch_bounds__(BLOCK_SIZE_T, MIN_BLOCKS_PER_SM)
 void mine_kernel(uint64_t        base_counter,
+                 uint64_t        max_counter,
                  volatile int   *found_flag,
                  volatile uint64_t *found_counter)
 {
-    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t my_counter = base_counter + tid * (uint64_t)WORK_PER_THREAD;
+    __shared__ volatile int s_found;
+    if (threadIdx.x == 0) s_found = *found_flag;
+    __syncthreads();
+
+    int t = threadIdx.x % 32;
+    int x = t % 5;
+    int y = t / 5;
+    
+    // Precompute shuffle targets
+    int src_t = t < 25 ? (((x + 3 * y) % 5) + 5 * x) : 0;
+    int chi_t1 = t < 25 ? (((x + 1) % 5) + 5 * y) : 0;
+    int chi_t2 = t < 25 ? (((x + 2) % 5) + 5 * y) : 0;
+    int rot_val = t < 25 ? d_rot[t] : 0;
+    
+    uint64_t lane0 = load_le64_const(d_challenge +  0);
+    uint64_t lane1 = load_le64_const(d_challenge +  8);
+    uint64_t lane2 = load_le64_const(d_challenge + 16);
+    uint64_t lane3 = load_le64_const(d_challenge + 24);
+    uint64_t lane4 = load_le64_const(d_prefix    +  0);
+    uint64_t lane5 = load_le64_const(d_prefix    +  8);
+    uint64_t lane6 = load_le64_const(d_prefix    + 16);
+
+    uint64_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    uint64_t stride = (gridDim.x * blockDim.x) / 32;
+
+    for (uint64_t offset = warp_id; ; offset += stride) {
+        uint64_t my_counter = base_counter + offset;
+
+        if ((offset & 0x7F) == 0) {
+            if (threadIdx.x == 0) s_found = *found_flag;
+            __syncthreads();
+        }
+        if (s_found || my_counter >= max_counter) return;
+
+        uint64_t st = 0;
+        if (t == 0) st = lane0;
+        else if (t == 1) st = lane1;
+        else if (t == 2) st = lane2;
+        else if (t == 3) st = lane3;
+        else if (t == 4) st = lane4;
+        else if (t == 5) st = lane5;
+        else if (t == 6) st = lane6;
+        else if (t == 7) st = bswap64(my_counter);
+        else if (t == 8) st = 0x0000000000000001ULL;
+        else if (t == 16) st = 0x8000000000000000ULL;
+
+        #pragma unroll 2
+        for (int r = 0; r < 24; r++) {
+            /* Theta */
+            uint64_t my_C = __shfl_sync(0xFFFFFFFF, st, x, 32) ^
+                            __shfl_sync(0xFFFFFFFF, st, x + 5, 32) ^
+                            __shfl_sync(0xFFFFFFFF, st, x + 10, 32) ^
+                            __shfl_sync(0xFFFFFFFF, st, x + 15, 32) ^
+                            __shfl_sync(0xFFFFFFFF, st, x + 20, 32);
+            
+            uint64_t Cx_minus_1 = __shfl_sync(0xFFFFFFFF, my_C, (x + 4) % 5, 32);
+            uint64_t Cx_plus_1  = __shfl_sync(0xFFFFFFFF, my_C, (x + 1) % 5, 32);
+            uint64_t D = Cx_minus_1 ^ ROTL64(Cx_plus_1, 1);
+            st ^= D;
+
+            /* Rho and Pi */
+            uint64_t new_st = ROTL64(__shfl_sync(0xFFFFFFFF, st, src_t, 32), rot_val);
+            st = new_st;
+
+            /* Chi */
+            uint64_t st_1 = __shfl_sync(0xFFFFFFFF, st, chi_t1, 32);
+            uint64_t st_2 = __shfl_sync(0xFFFFFFFF, st, chi_t2, 32);
+            st = st ^ (~st_1 & st_2);
+
+            /* Iota */
+            if (t == 0) {
+                st ^= d_RC[r];
+            }
+        }
+
+        uint64_t s0 = __shfl_sync(0xFFFFFFFF, st, 0, 32);
+        uint64_t s1 = __shfl_sync(0xFFFFFFFF, st, 1, 32);
+        uint64_t s2 = __shfl_sync(0xFFFFFFFF, st, 2, 32);
+        uint64_t s3 = __shfl_sync(0xFFFFFFFF, st, 3, 32);
+        
+        if (t == 0) {
+            if (hash_lt_difficulty(s0, s1, s2, s3)) {
+                if (atomicCAS((int*)found_flag, 0, 1) == 0) {
+                    *found_counter = my_counter;
+                }
+                s_found = 1;
+            }
+        }
+    }
+}
+
+#else
+
+template <int BLOCK_SIZE_T>
+__global__
+__launch_bounds__(BLOCK_SIZE_T, MIN_BLOCKS_PER_SM)
+void mine_kernel(uint64_t        base_counter,
+                 uint64_t        max_counter,
+                 volatile int   *found_flag,
+                 volatile uint64_t *found_counter)
+{
+    __shared__ volatile int s_found;
+    if (threadIdx.x == 0) s_found = *found_flag;
+    __syncthreads();
 
     /* Preload constant lanes 0-6 into registers (done once per thread) */
     uint64_t lane0 = load_le64_const(d_challenge +  0);
@@ -166,36 +274,118 @@ void mine_kernel(uint64_t        base_counter,
     uint64_t lane5 = load_le64_const(d_prefix    +  8);
     uint64_t lane6 = load_le64_const(d_prefix    + 16);
 
-    #pragma unroll
-    for (int w = 0; w < WORK_PER_THREAD; w++) {
-        if (*found_flag) return;  /* early exit if another thread won */
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t stride = gridDim.x * blockDim.x;
+    
+    // Strided nonce traversal
+    for (uint64_t offset = tid; ; offset += stride) {
+        uint64_t my_counter = base_counter + offset;
+        
+        // Every few iterations, check the global found flag.
+        // We use a shared variable to reduce global memory pressure.
+        if ((offset & 0x7F) == 0) {
+            if (threadIdx.x == 0) s_found = *found_flag;
+            __syncthreads();
+        }
+        if (s_found || my_counter >= max_counter) return;
 
         /*
-         * Build keccak state from inputs.
-         * Initial state = all-zero XOR input lanes (XOR with 0 = assign).
-         * Input: challenge[32] || prefix[24] || counter_be[8] = 64 bytes
-         *   -> lanes 0-7.  Padding: lane[8] ^= 0x01, lane[16] ^= 0x80..0
+         * Build keccak state from inputs. Scalar variables to avoid array indexing/spills.
          */
-        uint64_t s[25];
-        s[ 0]=lane0; s[ 1]=lane1; s[ 2]=lane2; s[ 3]=lane3;
-        s[ 4]=lane4; s[ 5]=lane5; s[ 6]=lane6;
-        s[ 7]=bswap64(my_counter + (uint64_t)w); /* big-endian counter */
-        s[ 8]=0x0000000000000001ULL;             /* keccak padding byte */
-        s[ 9]=0; s[10]=0; s[11]=0; s[12]=0;
-        s[13]=0; s[14]=0; s[15]=0;
-        s[16]=0x8000000000000000ULL;             /* last byte of rate */
-        s[17]=0; s[18]=0; s[19]=0; s[20]=0;
-        s[21]=0; s[22]=0; s[23]=0; s[24]=0;
+        uint64_t s00 = lane0;
+        uint64_t s01 = lane1;
+        uint64_t s02 = lane2;
+        uint64_t s03 = lane3;
+        uint64_t s04 = lane4;
+        uint64_t s05 = lane5;
+        uint64_t s06 = lane6;
+        uint64_t s07 = bswap64(my_counter);
+        uint64_t s08 = 0x0000000000000001ULL;
+        uint64_t s09 = 0;
+        uint64_t s10 = 0;
+        uint64_t s11 = 0;
+        uint64_t s12 = 0;
+        uint64_t s13 = 0;
+        uint64_t s14 = 0;
+        uint64_t s15 = 0;
+        uint64_t s16 = 0x8000000000000000ULL;
+        uint64_t s17 = 0;
+        uint64_t s18 = 0;
+        uint64_t s19 = 0;
+        uint64_t s20 = 0;
+        uint64_t s21 = 0;
+        uint64_t s22 = 0;
+        uint64_t s23 = 0;
+        uint64_t s24 = 0;
 
-        keccak_f1600(s);
+        // Reduce unrolling to limit register pressure.
+        // Full unrolling (24 times) creates massive register pressure because the compiler 
+        // tries to keep intermediates alive across rounds.
+        // Unrolling by 2 or 4 strikes a balance between instruction cache and register usage.
+        #pragma unroll 2
+        for (int r = 0; r < 24; r++) {
+            /* Theta */
+            // We calculate C inline and reuse D directly to avoid keeping C0..C4 alive
+            uint64_t D0 = (s04^s09^s14^s19^s24) ^ ROTL64(s01^s06^s11^s16^s21, 1);
+            uint64_t D1 = (s00^s05^s10^s15^s20) ^ ROTL64(s02^s07^s12^s17^s22, 1);
+            uint64_t D2 = (s01^s06^s11^s16^s21) ^ ROTL64(s03^s08^s13^s18^s23, 1);
+            uint64_t D3 = (s02^s07^s12^s17^s22) ^ ROTL64(s04^s09^s14^s19^s24, 1);
+            uint64_t D4 = (s03^s08^s13^s18^s23) ^ ROTL64(s00^s05^s10^s15^s20, 1);
 
-        if (hash_lt_difficulty(s)) {
-            if (atomicCAS((int*)found_flag, 0, 1) == 0)
-                *found_counter = my_counter + (uint64_t)w;
+            s00^=D0; s05^=D0; s10^=D0; s15^=D0; s20^=D0;
+            s01^=D1; s06^=D1; s11^=D1; s16^=D1; s21^=D1;
+            s02^=D2; s07^=D2; s12^=D2; s17^=D2; s22^=D2;
+            s03^=D3; s08^=D3; s13^=D3; s18^=D3; s23^=D3;
+            s04^=D4; s09^=D4; s14^=D4; s19^=D4; s24^=D4;
+
+            /* Rho and Pi */
+            uint64_t t   = s01;
+            s01 = ROTL64(s06, 44);
+            s06 = ROTL64(s09, 20);
+            s09 = ROTL64(s22, 61);
+            s22 = ROTL64(s14, 39);
+            s14 = ROTL64(s20, 18);
+            s20 = ROTL64(s02, 62);
+            s02 = ROTL64(s12, 43);
+            s12 = ROTL64(s13, 25);
+            s13 = ROTL64(s19,  8);
+            s19 = ROTL64(s23, 56);
+            s23 = ROTL64(s15, 41);
+            s15 = ROTL64(s04, 27);
+            s04 = ROTL64(s24, 14);
+            s24 = ROTL64(s21,  2);
+            s21 = ROTL64(s08, 55);
+            s08 = ROTL64(s16, 45);
+            s16 = ROTL64(s05, 36);
+            s05 = ROTL64(s03, 28);
+            s03 = ROTL64(s18, 21);
+            s18 = ROTL64(s17, 15);
+            s17 = ROTL64(s11, 10);
+            s11 = ROTL64(s07,  6);
+            s07 = ROTL64(s10,  3);
+            s10 = ROTL64(t,    1);
+
+            /* Chi */
+            t = s00; s00 = s00^(~s01&s02); s01 = s01^(~s02&s03); s02 = s02^(~s03&s04); s03 = s03^(~s04&t); s04 = s04^(~t&s01);
+            t = s05; s05 = s05^(~s06&s07); s06 = s06^(~s07&s08); s07 = s07^(~s08&s09); s08 = s08^(~s09&t); s09 = s09^(~t&s06);
+            t = s10; s10 = s10^(~s11&s12); s11 = s11^(~s12&s13); s12 = s12^(~s13&s14); s13 = s13^(~s14&t); s14 = s14^(~t&s11);
+            t = s15; s15 = s15^(~s16&s17); s16 = s16^(~s17&s18); s17 = s17^(~s18&s19); s18 = s18^(~s19&t); s19 = s19^(~t&s16);
+            t = s20; s20 = s20^(~s21&s22); s21 = s21^(~s22&s23); s22 = s22^(~s23&s24); s23 = s23^(~s24&t); s24 = s24^(~t&s21);
+
+            /* Iota */
+            s00 ^= d_RC[r];
+        }
+
+        if (hash_lt_difficulty(s00, s01, s02, s03)) {
+            if (atomicCAS((int*)found_flag, 0, 1) == 0) {
+                *found_counter = my_counter;
+            }
+            s_found = 1;
             return;
         }
     }
 }
+#endif
 
 /* ============================== Host code ================================== */
 
@@ -263,6 +453,65 @@ static void pack_difficulty_be(const uint8_t *diff, uint64_t out[4]) {
     }
 }
 
+/* Autotuner Configs */
+typedef void (*mine_kernel_t)(uint64_t, uint64_t, volatile int*, volatile uint64_t*);
+
+struct KernelConfig {
+    int block_size;
+    mine_kernel_t func;
+};
+
+#define INSTANTIATE_KERNEL(BS) { BS, mine_kernel<BS> }
+
+KernelConfig configs[] = {
+    INSTANTIATE_KERNEL(64),
+    INSTANTIATE_KERNEL(128),
+    INSTANTIATE_KERNEL(192),
+    INSTANTIATE_KERNEL(256),
+#if WARP_COOP
+    INSTANTIATE_KERNEL(512)
+#endif
+};
+
+static double test_hashrate(KernelConfig cfg, int wpt, cudaStream_t stream, int* d_flag, uint64_t* d_counter) {
+    uint64_t test_hashes = 20000000ULL; // 20M hashes for the test
+    
+#if WARP_COOP
+    size_t grid = (test_hashes / wpt) / (cfg.block_size / 32);
+#else
+    size_t grid = test_hashes / (cfg.block_size * wpt);
+#endif
+    if (grid == 0) grid = 1;
+
+#if WARP_COOP
+    uint64_t actual_hashes = (uint64_t)grid * (cfg.block_size / 32) * wpt;
+#else
+    uint64_t actual_hashes = (uint64_t)grid * cfg.block_size * wpt;
+#endif
+
+    CUDA_CHECK(cudaMemsetAsync(d_flag, 0, sizeof(int), stream));
+    
+    // Warmup
+    cfg.func<<<(unsigned)grid, cfg.block_size, 0, stream>>>(0, actual_hashes, d_flag, d_counter);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    
+    // Benchmark
+    CUDA_CHECK(cudaMemsetAsync(d_flag, 0, sizeof(int), stream));
+    uint64_t t_start = now_ms();
+    
+    // Launch a few times to average out overhead
+    for(int i=0; i<3; i++) {
+        cfg.func<<<(unsigned)grid, cfg.block_size, 0, stream>>>(0, actual_hashes, d_flag, d_counter);
+    }
+    
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    uint64_t t_end = now_ms();
+    
+    double elapsed_sec = (t_end - t_start) / 1000.0;
+    if (elapsed_sec <= 0) return 0;
+    return ((actual_hashes * 3) / elapsed_sec) / 1000000.0; // return MH/s
+}
+
 int main(int argc, char **argv) {
     const char *challenge_hex    = NULL;
     const char *difficulty_hex   = NULL;
@@ -325,24 +574,53 @@ int main(int argc, char **argv) {
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop,device_index));
 
-    /* Auto batch size: target ~20 ms per launch, scale with SM count */
-    if (batch_size==0) {
-        size_t auto_b=(size_t)prop.multiProcessorCount*2048*WORK_PER_THREAD;
-        if (auto_b < (1u<<20)) auto_b = (1u<<20);  /* min 1M  */
-        if (auto_b > (1u<<25)) auto_b = (1u<<25);  /* max 32M */
-        size_t grain = (size_t)BLOCK_SIZE*WORK_PER_THREAD;
-        batch_size = ((auto_b+grain-1)/grain)*grain;
-    }
-
-    /* Upload constants to device */
-    CUDA_CHECK(cudaMemcpyToSymbol(d_challenge, challenge,    32));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_prefix,    nonce_prefix, 24));
-    uint64_t diff_be[4]; pack_difficulty_be(difficulty,diff_be);
-    CUDA_CHECK(cudaMemcpyToSymbol(d_difficulty_be, diff_be,  32));
-
     /* Allocate device-side output buffers */
     int      *d_flag;    CUDA_CHECK(cudaMalloc(&d_flag,    sizeof(int)));
     uint64_t *d_counter; CUDA_CHECK(cudaMalloc(&d_counter, sizeof(uint64_t)));
+    
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    /* Auto-Tune block size and work per thread */
+    KernelConfig best_cfg = configs[1]; // default 128
+    int best_wpt = 16;
+    double best_mhs = 0;
+
+    if (batch_size == 0) {
+        printf("{\"type\":\"progress\", \"message\":\"Starting Auto-Tune (Block Size & WPT)...\"}\n");
+        fflush(stdout);
+        
+        // Backup difficulty and set to zero to avoid early exit during benchmark
+        ulonglong4 zero_diff = {0,0,0,0};
+        CUDA_CHECK(cudaMemcpyToSymbol(d_difficulty_be_vec, &zero_diff, 32));
+
+        int wpt_opts[] = {1, 2, 4, 8, 16, 32};
+        for (int i=0; i < sizeof(configs)/sizeof(configs[0]); i++) {
+            for (int w=0; w < 6; w++) {
+                int wpt = wpt_opts[w];
+                double mhs = test_hashrate(configs[i], wpt, stream, d_flag, d_counter);
+                printf("{\"type\":\"autotune\", \"block_size\":%d, \"work_per_thread\":%d, \"mhs\":%.2f}\n", 
+                    configs[i].block_size, wpt, mhs);
+                fflush(stdout);
+                if (mhs > best_mhs) {
+                    best_mhs = mhs;
+                    best_cfg = configs[i];
+                    best_wpt = wpt;
+                }
+            }
+        }
+        
+        // Restore difficulty
+        CUDA_CHECK(cudaMemcpyToSymbol(d_difficulty_be_vec, diff_be, 32));
+
+        printf("{\"type\":\"autotune_done\", \"best_block_size\":%d, \"best_wpt\":%d, \"best_mhs\":%.2f}\n", 
+                best_cfg.block_size, best_wpt, best_mhs);
+        fflush(stdout);
+        
+        // Target ~50ms batch to keep progress reporting responsive
+        batch_size = (size_t)(best_mhs * 1000000.0 * 0.05);
+        if (batch_size < 1000000) batch_size = 1000000;
+    }
 
     /* Report device info */
     {
@@ -350,9 +628,9 @@ int main(int argc, char **argv) {
         json_escape(dn,sizeof(dn),prop.name);
         printf("{\"type\":\"device\",\"platform\":\"CUDA\","
                "\"device\":\"%s\",\"vendor\":\"NVIDIA\","
-               "\"cu\":%d,\"max_wg\":%zu,\"batch_size\":%zu,\"local_size\":%d}\n",
+               "\"cu\":%d,\"max_wg\":%zu,\"batch_size\":%zu,\"local_size\":%d,\"wpt\":%d}\n",
                dn,prop.multiProcessorCount,
-               (size_t)prop.maxThreadsPerBlock,batch_size,BLOCK_SIZE);
+               (size_t)prop.maxThreadsPerBlock,batch_size,best_cfg.block_size,best_wpt);
         fflush(stdout);
     }
 
@@ -360,23 +638,47 @@ int main(int argc, char **argv) {
     uint64_t next_counter = start_counter;
     uint64_t total_hashes = 0;
     uint64_t last_prog_t  = now_ms();
-    size_t   grid         = batch_size / ((size_t)BLOCK_SIZE * WORK_PER_THREAD);
-    if (grid==0) grid=1;
+    
+    size_t grid;
+#if WARP_COOP
+    grid = (batch_size / best_wpt) / (best_cfg.block_size / 32);
+#else
+    grid = batch_size / ((size_t)best_cfg.block_size * best_wpt);
+#endif
+    if (grid == 0) grid = 1;
+
+    // Use a persistent kernel. We still launch in a loop so the host can periodically print progress.
+    // The kernel itself will run for `grid * BLOCK_SIZE * WORK_PER_THREAD` nonces per launch,
+    // but the threads inside it will strided-loop over that range.
+    
+    int *h_flag;
+    uint64_t *h_counter;
+    CUDA_CHECK(cudaMallocHost(&h_flag, sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&h_counter, sizeof(uint64_t)));
 
     for (;;) {
-        CUDA_CHECK(cudaMemset(d_flag, 0, sizeof(int)));
+        *h_flag = 0;
+        CUDA_CHECK(cudaMemcpyAsync(d_flag, h_flag, sizeof(int), cudaMemcpyHostToDevice, stream));
 
-        mine_kernel<<<(unsigned)grid, BLOCK_SIZE>>>(
-            next_counter, d_flag, d_counter);
+#if WARP_COOP
+        uint64_t hashes_this_iter = (uint64_t)grid * (best_cfg.block_size / 32) * best_wpt;
+#else
+        uint64_t hashes_this_iter = (uint64_t)grid * best_cfg.block_size * best_wpt;
+#endif
+        uint64_t max_counter = next_counter + hashes_this_iter;
+
+        best_cfg.func<<<(unsigned)grid, best_cfg.block_size, 0, stream>>>(
+            next_counter, max_counter, d_flag, d_counter);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        // Asynchronous memcpy to pinned host memory
+        CUDA_CHECK(cudaMemcpyAsync(h_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        total_hashes += (uint64_t)grid * BLOCK_SIZE * WORK_PER_THREAD;
-        next_counter += (uint64_t)grid * BLOCK_SIZE * WORK_PER_THREAD;
+        total_hashes += hashes_this_iter;
+        next_counter = max_counter;
 
-        int flag=0;
-        CUDA_CHECK(cudaMemcpy(&flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
-        if (flag) {
+        if (*h_flag) {
             uint64_t winner=0;
             CUDA_CHECK(cudaMemcpy(&winner, d_counter, sizeof(uint64_t), cudaMemcpyDeviceToHost));
             printf("{\"type\":\"found\",\"counter\":\"%" PRIu64 "\",\"hashes\":\"%" PRIu64 "\"}\n",
@@ -394,6 +696,9 @@ int main(int argc, char **argv) {
         }
     }
 
+    cudaFreeHost(h_flag);
+    cudaFreeHost(h_counter);
+    cudaStreamDestroy(stream);
     cudaFree(d_flag);
     cudaFree(d_counter);
     return 0;
