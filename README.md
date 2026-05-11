@@ -77,62 +77,6 @@ Difficulty retargets every **2,016 mints** (same formula as Bitcoin), targeting 
 Full distribution takes approximately **~290 days**.
 
 ---
-
-## 游戏说明（简体中文）
-
-### 为什么显示"Mining is not open"？
-
-HASH 采用**三阶段上线机制**，均由智能合约强制执行：
-
-**第一阶段 · Genesis 创世发行**（可能仍在进行中）
-- 以固定价格 **0.01 ETH / 1,000 HASH**（约 $0.03/枚）发售 1,050,000 HASH
-- 每笔交易最多购买 5,000 HASH，无钱包上限，先到先得
-- 所有 ETH 锁定在合约内，直到流动池启动
-- 售完后自动关闭
-- ➜ 参与创世发行：https://hash256.fun/
-
-**第二阶段 · 启动流动池**
-- 创世售完后，任何人都可以调用合约的 `seedPool()` 函数
-- 合约自动将 10.5 ETH + 1,050,000 HASH 注入 Uniswap V4 流动池
-- LP 永久锁定，无人可提取
-- 初始价格与创世价格相同：$0.03
-
-**第三阶段 · 挖矿开放**
-- `seedPool()` 调用后，合约的 `genesisComplete` 变为 `true`
-- 此时本 CLI 工具才可正常挖矿
-- 提交有效 nonce 即可铸造 HASH 并直接发送到你的钱包
-
-### 核心机制
-
-- **工作量证明**：在本地暴力搜索 keccak256 哈希，找到小于当前难度目标的 nonce
-- **地址绑定**：挑战值与你的钱包地址绑定，无法被抢跑
-- **纪元轮换**：每约 20 分钟（100 个区块）更换挑战值，防止预计算
-- **难度调整**：每 2,016 次铸造重新调整一次，目标全网 1 分钟一次铸造
-- **减半机制**：每 100,000 次铸造奖励减半，总量硬上限 2,100 万枚
-
-### 代币分配
-
-| 类别 | 数量 |
-|---|---|
-| 创世发行 | 1,050,000 HASH（5%）|
-| 流动池（永久锁定）| 1,050,000 HASH（5%）|
-| 挖矿奖励 | 18,900,000 HASH（90%）|
-| 团队 / 投资机构 / 空投 | **0%** |
-
-### 重要链接
-
-| 页面 | 链接 |
-|---|---|
-| 官网 & 创世发行 | https://hash256.fun/ |
-| 挖矿页面 | https://hash256.fun/mine |
-| 流动池 | https://hash256.fun/pool |
-| 交易动态 | https://hash256.fun/feed |
-| 白皮书 | https://hash256.fun/whitepaper |
-| 合约（Etherscan）| https://etherscan.io/address/0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc |
-| 官方 X（Twitter）| https://x.com/hash256dotorg |
-
----
-
 ## From 0 to Running
 
 ### Step 1 — Prerequisites
@@ -150,7 +94,7 @@ HASH 采用**三阶段上线机制**，均由智能合约强制执行：
 ### Step 2 — Clone & Install
 
 ```bash
-git clone https://github.com/hash256fun/hash256-cli.git
+git clone https://github.com/gjs222/hash256-cli.git
 cd hash256-cli
 npm install
 ```
