@@ -574,6 +574,13 @@ int main(int argc, char **argv) {
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop,device_index));
 
+    /* Upload constants to device */
+    CUDA_CHECK(cudaMemcpyToSymbol(d_challenge, challenge,    32));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_prefix,    nonce_prefix, 24));
+    uint64_t diff_be[4]; pack_difficulty_be(difficulty,diff_be);
+    // Copy as ulonglong4
+    CUDA_CHECK(cudaMemcpyToSymbol(d_difficulty_be_vec, diff_be,  32));
+
     /* Allocate device-side output buffers */
     int      *d_flag;    CUDA_CHECK(cudaMalloc(&d_flag,    sizeof(int)));
     uint64_t *d_counter; CUDA_CHECK(cudaMalloc(&d_counter, sizeof(uint64_t)));
