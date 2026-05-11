@@ -1,0 +1,26 @@
+{
+  "name": "hash256-cli",
+  "version": "0.1.0",
+  "description": "CPU / OpenCL / CUDA CLI miner for HASH (hash256.fun) — uses the official WASM miner for CPU and a native keccak256 kernel for GPU.",
+  "type": "module",
+  "bin": {
+    "hash256-mine": "./src/cli.js"
+  },
+  "scripts": {
+    "mine": "node ./src/cli.js",
+    "mine:gpu": "node ./src/cli.js --gpu",
+    "status": "node ./src/cli.js --status",
+    "benchmark": "node ./src/cli.js --benchmark",
+    "benchmark:gpu": "node ./src/cli.js --gpu --benchmark",
+    "check": "node --check ./src/cli.js && node --check ./src/worker.js",
+    "postinstall": "node scripts/download-wasm.js",
+    "refresh-miner": "node scripts/download-wasm.js"
+  },
+  "dependencies": {
+    "ethers": "^6.15.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

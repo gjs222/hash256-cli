@@ -1,0 +1,21 @@
+# dependencies
+node_modules/
+
+# secrets — NEVER commit private keys
+.env
+.env.*
+!.env.example
+
+# compiled GPU binaries (platform-specific, build locally)
+src/gpu_miner.exe
+src/gpu_miner
+src/gpu_miner_cuda
+
+# OS
+.DS_Store
+Thumbs.db
+
+# editors
+.vscode/
+*.swp
+
