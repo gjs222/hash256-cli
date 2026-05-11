@@ -48,7 +48,7 @@
 // Toggle for experimental Warp-Cooperative Keccak (Step 9)
 // 1 = 1 Warp per Hash (32 threads share 1 state)
 // 0 = 1 Thread per Hash (Default)
-#define WARP_COOP 1
+#define WARP_COOP 0
 
 /* -- Constant memory (L1-cached, broadcast to all threads in warp) --------- */
 __constant__ uint8_t  d_challenge[32];
@@ -100,6 +100,20 @@ __device__ __forceinline__ uint64_t rotl64_ptx(uint64_t x, int n) {
 }
 
 #define ROTL64(x, n) rotl64_ptx((x), (n))
+
+/* Inline PTX LOP3 instruction for Keccak Chi step.
+ * Computes: a ^ (~b & c) in a single instruction per 32-bit half.
+ * The LUT truth table for this operation is 0x9A.
+ */
+__device__ __forceinline__ uint64_t chi64_ptx(uint64_t a, uint64_t b, uint64_t c) {
+    uint32_t a_lo = (uint32_t)a, a_hi = (uint32_t)(a >> 32);
+    uint32_t b_lo = (uint32_t)b, b_hi = (uint32_t)(b >> 32);
+    uint32_t c_lo = (uint32_t)c, c_hi = (uint32_t)(c >> 32);
+    uint32_t res_lo, res_hi;
+    asm("lop3.b32 %0, %1, %2, %3, 0x9A;" : "=r"(res_lo) : "r"(a_lo), "r"(b_lo), "r"(c_lo));
+    asm("lop3.b32 %0, %1, %2, %3, 0x9A;" : "=r"(res_hi) : "r"(a_hi), "r"(b_hi), "r"(c_hi));
+    return ((uint64_t)res_hi << 32) | res_lo;
+}
 
 /* Byte-swap uint64 (big-endian counter <-> little-endian keccak lane) */
 __device__ __forceinline__ uint64_t bswap64(uint64_t x) {
@@ -318,19 +332,20 @@ void mine_kernel(uint64_t        base_counter,
         uint64_t s23 = 0;
         uint64_t s24 = 0;
 
-        // Reduce unrolling to limit register pressure.
-        // Full unrolling (24 times) creates massive register pressure because the compiler 
-        // tries to keep intermediates alive across rounds.
-        // Unrolling by 2 or 4 strikes a balance between instruction cache and register usage.
-        #pragma unroll 2
+        #pragma unroll
         for (int r = 0; r < 24; r++) {
             /* Theta */
-            // We calculate C inline and reuse D directly to avoid keeping C0..C4 alive
-            uint64_t D0 = (s04^s09^s14^s19^s24) ^ ROTL64(s01^s06^s11^s16^s21, 1);
-            uint64_t D1 = (s00^s05^s10^s15^s20) ^ ROTL64(s02^s07^s12^s17^s22, 1);
-            uint64_t D2 = (s01^s06^s11^s16^s21) ^ ROTL64(s03^s08^s13^s18^s23, 1);
-            uint64_t D3 = (s02^s07^s12^s17^s22) ^ ROTL64(s04^s09^s14^s19^s24, 1);
-            uint64_t D4 = (s03^s08^s13^s18^s23) ^ ROTL64(s00^s05^s10^s15^s20, 1);
+            uint64_t C0 = s00^s05^s10^s15^s20;
+            uint64_t C1 = s01^s06^s11^s16^s21;
+            uint64_t C2 = s02^s07^s12^s17^s22;
+            uint64_t C3 = s03^s08^s13^s18^s23;
+            uint64_t C4 = s04^s09^s14^s19^s24;
+
+            uint64_t D0 = C4^ROTL64(C1, 1);
+            uint64_t D1 = C0^ROTL64(C2, 1);
+            uint64_t D2 = C1^ROTL64(C3, 1);
+            uint64_t D3 = C2^ROTL64(C4, 1);
+            uint64_t D4 = C3^ROTL64(C0, 1);
 
             s00^=D0; s05^=D0; s10^=D0; s15^=D0; s20^=D0;
             s01^=D1; s06^=D1; s11^=D1; s16^=D1; s21^=D1;
@@ -365,12 +380,41 @@ void mine_kernel(uint64_t        base_counter,
             s07 = ROTL64(s10,  3);
             s10 = ROTL64(t,    1);
 
-            /* Chi */
-            t = s00; s00 = s00^(~s01&s02); s01 = s01^(~s02&s03); s02 = s02^(~s03&s04); s03 = s03^(~s04&t); s04 = s04^(~t&s01);
-            t = s05; s05 = s05^(~s06&s07); s06 = s06^(~s07&s08); s07 = s07^(~s08&s09); s08 = s08^(~s09&t); s09 = s09^(~t&s06);
-            t = s10; s10 = s10^(~s11&s12); s11 = s11^(~s12&s13); s12 = s12^(~s13&s14); s13 = s13^(~s14&t); s14 = s14^(~t&s11);
-            t = s15; s15 = s15^(~s16&s17); s16 = s16^(~s17&s18); s17 = s17^(~s18&s19); s18 = s18^(~s19&t); s19 = s19^(~t&s16);
-            t = s20; s20 = s20^(~s21&s22); s21 = s21^(~s22&s23); s22 = s22^(~s23&s24); s23 = s23^(~s24&t); s24 = s24^(~t&s21);
+            /* Chi (Optimized with LOP3 and correct temporaries) */
+            uint64_t t0 = s00, t1 = s01;
+            s00 = chi64_ptx(s00, s01, s02);
+            s01 = chi64_ptx(s01, s02, s03);
+            s02 = chi64_ptx(s02, s03, s04);
+            s03 = chi64_ptx(s03, s04, t0);
+            s04 = chi64_ptx(s04, t0, t1);
+
+            t0 = s05; t1 = s06;
+            s05 = chi64_ptx(s05, s06, s07);
+            s06 = chi64_ptx(s06, s07, s08);
+            s07 = chi64_ptx(s07, s08, s09);
+            s08 = chi64_ptx(s08, s09, t0);
+            s09 = chi64_ptx(s09, t0, t1);
+
+            t0 = s10; t1 = s11;
+            s10 = chi64_ptx(s10, s11, s12);
+            s11 = chi64_ptx(s11, s12, s13);
+            s12 = chi64_ptx(s12, s13, s14);
+            s13 = chi64_ptx(s13, s14, t0);
+            s14 = chi64_ptx(s14, t0, t1);
+
+            t0 = s15; t1 = s16;
+            s15 = chi64_ptx(s15, s16, s17);
+            s16 = chi64_ptx(s16, s17, s18);
+            s17 = chi64_ptx(s17, s18, s19);
+            s18 = chi64_ptx(s18, s19, t0);
+            s19 = chi64_ptx(s19, t0, t1);
+
+            t0 = s20; t1 = s21;
+            s20 = chi64_ptx(s20, s21, s22);
+            s21 = chi64_ptx(s21, s22, s23);
+            s22 = chi64_ptx(s22, s23, s24);
+            s23 = chi64_ptx(s23, s24, t0);
+            s24 = chi64_ptx(s24, t0, t1);
 
             /* Iota */
             s00 ^= d_RC[r];
