@@ -78,42 +78,7 @@ __constant__ uint64_t d_RC[24] = {
 
 /* -- Helpers --------------------------------------------------------------- */
 
-/* Inline PTX 64-bit rotate left.
- * T4 (Turing) supports shf.l.wrap.b32 (funnel shift).
- * A 64-bit rotate left by n (0 < n < 64) is achieved using two 32-bit funnel shifts.
- */
-__device__ __forceinline__ uint64_t rotl64_ptx(uint64_t x, int n) {
-    uint32_t lo = (uint32_t)x;
-    uint32_t hi = (uint32_t)(x >> 32);
-    uint32_t res_lo, res_hi;
-    if (n < 32) {
-        asm("shf.l.wrap.b32 %0, %1, %2, %3;" : "=r"(res_lo) : "r"(lo), "r"(hi), "r"(n));
-        asm("shf.l.wrap.b32 %0, %1, %2, %3;" : "=r"(res_hi) : "r"(hi), "r"(lo), "r"(n));
-    } else if (n > 32) {
-        asm("shf.l.wrap.b32 %0, %1, %2, %3;" : "=r"(res_lo) : "r"(hi), "r"(lo), "r"(n - 32));
-        asm("shf.l.wrap.b32 %0, %1, %2, %3;" : "=r"(res_hi) : "r"(lo), "r"(hi), "r"(n - 32));
-    } else { // n == 32
-        res_lo = hi;
-        res_hi = lo;
-    }
-    return ((uint64_t)res_hi << 32) | res_lo;
-}
-
-#define ROTL64(x, n) rotl64_ptx((x), (n))
-
-/* Inline PTX LOP3 instruction for Keccak Chi step.
- * Computes: a ^ (~b & c) in a single instruction per 32-bit half.
- * The LUT truth table for this operation is 0x9A.
- */
-__device__ __forceinline__ uint64_t chi64_ptx(uint64_t a, uint64_t b, uint64_t c) {
-    uint32_t a_lo = (uint32_t)a, a_hi = (uint32_t)(a >> 32);
-    uint32_t b_lo = (uint32_t)b, b_hi = (uint32_t)(b >> 32);
-    uint32_t c_lo = (uint32_t)c, c_hi = (uint32_t)(c >> 32);
-    uint32_t res_lo, res_hi;
-    asm("lop3.b32 %0, %1, %2, %3, 0x9A;" : "=r"(res_lo) : "r"(a_lo), "r"(b_lo), "r"(c_lo));
-    asm("lop3.b32 %0, %1, %2, %3, 0x9A;" : "=r"(res_hi) : "r"(a_hi), "r"(b_hi), "r"(c_hi));
-    return ((uint64_t)res_hi << 32) | res_lo;
-}
+#define ROTL64(x, n) (((x) << (n)) | ((x) >> (64 - (n))))
 
 /* Byte-swap uint64 (big-endian counter <-> little-endian keccak lane) */
 __device__ __forceinline__ uint64_t bswap64(uint64_t x) {
@@ -353,68 +318,41 @@ void mine_kernel(uint64_t        base_counter,
             s03^=D3; s08^=D3; s13^=D3; s18^=D3; s23^=D3;
             s04^=D4; s09^=D4; s14^=D4; s19^=D4; s24^=D4;
 
-            /* Rho and Pi */
-            uint64_t t   = s01;
-            s01 = ROTL64(s06, 44);
-            s06 = ROTL64(s09, 20);
-            s09 = ROTL64(s22, 61);
-            s22 = ROTL64(s14, 39);
-            s14 = ROTL64(s20, 18);
-            s20 = ROTL64(s02, 62);
-            s02 = ROTL64(s12, 43);
-            s12 = ROTL64(s13, 25);
-            s13 = ROTL64(s19,  8);
-            s19 = ROTL64(s23, 56);
-            s23 = ROTL64(s15, 41);
-            s15 = ROTL64(s04, 27);
-            s04 = ROTL64(s24, 14);
-            s24 = ROTL64(s21,  2);
-            s21 = ROTL64(s08, 55);
-            s08 = ROTL64(s16, 45);
-            s16 = ROTL64(s05, 36);
-            s05 = ROTL64(s03, 28);
-            s03 = ROTL64(s18, 21);
-            s18 = ROTL64(s17, 15);
-            s17 = ROTL64(s11, 10);
-            s11 = ROTL64(s07,  6);
-            s07 = ROTL64(s10,  3);
-            s10 = ROTL64(t,    1);
+            /* Rho and Pi (No false dependencies) */
+            uint64_t B00 = s00;
+            uint64_t B10 = ROTL64(s01,  1); uint64_t B20 = ROTL64(s02, 62);
+            uint64_t B05 = ROTL64(s03, 28); uint64_t B15 = ROTL64(s04, 27);
+            uint64_t B16 = ROTL64(s05, 36); uint64_t B01 = ROTL64(s06, 44);
+            uint64_t B11 = ROTL64(s07,  6); uint64_t B21 = ROTL64(s08, 55);
+            uint64_t B06 = ROTL64(s09, 20); uint64_t B07 = ROTL64(s10,  3);
+            uint64_t B17 = ROTL64(s11, 10); uint64_t B02 = ROTL64(s12, 43);
+            uint64_t B12 = ROTL64(s13, 25); uint64_t B22 = ROTL64(s14, 39);
+            uint64_t B23 = ROTL64(s15, 41); uint64_t B08 = ROTL64(s16, 45);
+            uint64_t B18 = ROTL64(s17, 15); uint64_t B03 = ROTL64(s18, 21);
+            uint64_t B13 = ROTL64(s19,  8); uint64_t B14 = ROTL64(s20, 18);
+            uint64_t B24 = ROTL64(s21,  2); uint64_t B09 = ROTL64(s22, 61);
+            uint64_t B19 = ROTL64(s23, 56); uint64_t B04 = ROTL64(s24, 14);
 
-            /* Chi (Optimized with LOP3 and correct temporaries) */
-            uint64_t t0 = s00, t1 = s01;
-            s00 = chi64_ptx(s00, s01, s02);
-            s01 = chi64_ptx(s01, s02, s03);
-            s02 = chi64_ptx(s02, s03, s04);
-            s03 = chi64_ptx(s03, s04, t0);
-            s04 = chi64_ptx(s04, t0, t1);
+            /* Chi (Compiler automatically optimizes into lop3.b32) */
+            s00 = B00 ^ (~B01 & B02); s01 = B01 ^ (~B02 & B03);
+            s02 = B02 ^ (~B03 & B04); s03 = B03 ^ (~B04 & B00);
+            s04 = B04 ^ (~B00 & B01);
 
-            t0 = s05; t1 = s06;
-            s05 = chi64_ptx(s05, s06, s07);
-            s06 = chi64_ptx(s06, s07, s08);
-            s07 = chi64_ptx(s07, s08, s09);
-            s08 = chi64_ptx(s08, s09, t0);
-            s09 = chi64_ptx(s09, t0, t1);
+            s05 = B05 ^ (~B06 & B07); s06 = B06 ^ (~B07 & B08);
+            s07 = B07 ^ (~B08 & B09); s08 = B08 ^ (~B09 & B05);
+            s09 = B09 ^ (~B05 & B06);
 
-            t0 = s10; t1 = s11;
-            s10 = chi64_ptx(s10, s11, s12);
-            s11 = chi64_ptx(s11, s12, s13);
-            s12 = chi64_ptx(s12, s13, s14);
-            s13 = chi64_ptx(s13, s14, t0);
-            s14 = chi64_ptx(s14, t0, t1);
+            s10 = B10 ^ (~B11 & B12); s11 = B11 ^ (~B12 & B13);
+            s12 = B12 ^ (~B13 & B14); s13 = B13 ^ (~B14 & B10);
+            s14 = B14 ^ (~B10 & B11);
 
-            t0 = s15; t1 = s16;
-            s15 = chi64_ptx(s15, s16, s17);
-            s16 = chi64_ptx(s16, s17, s18);
-            s17 = chi64_ptx(s17, s18, s19);
-            s18 = chi64_ptx(s18, s19, t0);
-            s19 = chi64_ptx(s19, t0, t1);
+            s15 = B15 ^ (~B16 & B17); s16 = B16 ^ (~B17 & B18);
+            s17 = B17 ^ (~B18 & B19); s18 = B18 ^ (~B19 & B15);
+            s19 = B19 ^ (~B15 & B16);
 
-            t0 = s20; t1 = s21;
-            s20 = chi64_ptx(s20, s21, s22);
-            s21 = chi64_ptx(s21, s22, s23);
-            s22 = chi64_ptx(s22, s23, s24);
-            s23 = chi64_ptx(s23, s24, t0);
-            s24 = chi64_ptx(s24, t0, t1);
+            s20 = B20 ^ (~B21 & B22); s21 = B21 ^ (~B22 & B23);
+            s22 = B22 ^ (~B23 & B24); s23 = B23 ^ (~B24 & B20);
+            s24 = B24 ^ (~B20 & B21);
 
             /* Iota */
             s00 ^= d_RC[r];
